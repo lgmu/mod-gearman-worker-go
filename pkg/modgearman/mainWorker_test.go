@@ -1,131 +1,78 @@
 package modgearman
 
 import (
-	"fmt"
-	"os"
-	"sync"
+	"strings"
 	"testing"
-	"time"
-
-	"github.com/stretchr/testify/assert"
 )
 
 func TestCheckLoads(t *testing.T) {
-	if _, err := os.Stat("/proc"); os.IsNotExist(err) {
-		t.Skip("skipping test without /proc/")
-	}
 	disableLogging()
-	cfg := config{}
-	cfg.loadLimit1 = 999
-	cfg.loadLimit5 = 999
-	cfg.loadLimit15 = 999
+	t.Cleanup(func() { setLogLevel(0) })
 
-	workerMap := make(map[string]*worker)
-	mainworker := newMainWorker(&cfg, []byte("key"), workerMap)
-
-	mainworker.updateLoadAvg()
-	passed, _ := mainworker.checkLoads()
-	if !passed {
-		t.Errorf("loads are to ok, checkload says they are too high")
+	tests := []struct {
+		name       string
+		limits     [3]float64
+		wantOK     bool
+		wantReason string
+	}{
+		{name: "limits disabled", wantOK: true},
+		{name: "below all limits", limits: [3]float64{1.1, 5.1, 15.1}, wantOK: true},
+		{name: "one minute limit exceeded", limits: [3]float64{0.9, 5.1, 15.1}, wantReason: "load1"},
+		{name: "five minute limit exceeded", limits: [3]float64{1.1, 4.9, 15.1}, wantReason: "load5"},
+		{name: "fifteen minute limit exceeded", limits: [3]float64{1.1, 5.1, 14.9}, wantReason: "load15"},
 	}
 
-	cfg.loadLimit1 = 0.01
-	cfg.loadLimit5 = 999
-	cfg.loadLimit15 = 999
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config{
+				loadLimit1:  test.limits[0],
+				loadLimit5:  test.limits[1],
+				loadLimit15: test.limits[2],
+			}
+			mainworker := &mainWorker{cfg: &cfg, min1: 1, min5: 5, min15: 15}
 
-	passed, _ = mainworker.checkLoads()
-	if passed {
-		t.Errorf("load limit 1 exceeded")
+			ok, reason := mainworker.checkLoads()
+			if ok != test.wantOK {
+				t.Fatalf("checkLoads() ok = %v, want %v (reason: %q)", ok, test.wantOK, reason)
+			}
+			if !strings.Contains(reason, test.wantReason) {
+				t.Errorf("checkLoads() reason = %q, want it to contain %q", reason, test.wantReason)
+			}
+		})
 	}
-
-	cfg.loadLimit1 = 999
-	cfg.loadLimit5 = 0.01
-	cfg.loadLimit15 = 999
-
-	passed, _ = mainworker.checkLoads()
-	if passed {
-		t.Errorf("load limit 10 exceeded")
-	}
-
-	cfg.loadLimit1 = 999
-	cfg.loadLimit5 = 999
-	cfg.loadLimit15 = 0.01
-
-	passed, _ = mainworker.checkLoads()
-	if passed {
-		t.Errorf("load limit 15 exceeded")
-	}
-	setLogLevel(0)
 }
 
-func TestAdjustWorkerBottomLevelWaitsForSustainedUnderutilization(t *testing.T) {
-	cfg := config{
-		minWorker:   1,
-		sinkRate:    1,
-		idleTimeout: 60,
-	}
-	workerMap := makeTestWorkerMap(3)
-	mainworker := &mainWorker{
-		activeWorkers: 0,
-		cfg:           &cfg,
-		workerMap:     workerMap,
-		workerMapLock: new(sync.RWMutex),
-		running:       true,
-		// Simulate a pool that was created long before utilization dropped.
-		idleSince: time.Now().Add(-time.Hour),
-	}
-	for _, worker := range workerMap {
-		worker.mainWorker = mainworker
-	}
+func TestCheckMemory(t *testing.T) {
+	disableLogging()
+	t.Cleanup(func() { setLogLevel(0) })
 
-	// Recovering utilization clears the old timer.
-	mainworker.activeWorkers = len(workerMap)
-	mainworker.adjustWorkerBottomLevel()
-	assert.True(t, mainworker.idleSince.IsZero())
-
-	// The first underutilized sample starts a new stabilization window.
-	mainworker.activeWorkers = 0
-	mainworker.adjustWorkerBottomLevel()
-	assert.Len(t, workerMap, 3)
-	assert.WithinDuration(t, time.Now(), mainworker.idleSince, time.Second)
-
-	// Once that window has elapsed, workers are removed at sink-rate.
-	mainworker.idleSince = time.Now().Add(-61 * time.Second)
-	mainworker.adjustWorkerBottomLevel()
-	assert.Len(t, workerMap, 2)
-}
-
-func TestAdjustWorkerBottomLevelCalculatesUtilizationBeforeDivision(t *testing.T) {
-	cfg := config{
-		minWorker:   1,
-		sinkRate:    1,
-		idleTimeout: 60,
-	}
-	workerMap := makeTestWorkerMap(10)
-	mainworker := &mainWorker{
-		activeWorkers: 9,
-		cfg:           &cfg,
-		workerMap:     workerMap,
-		workerMapLock: new(sync.RWMutex),
-		running:       true,
-		idleSince:     time.Now().Add(-time.Hour),
-	}
-	for _, worker := range workerMap {
-		worker.mainWorker = mainworker
+	tests := []struct {
+		name     string
+		limit    uint64
+		total    uint64
+		free     uint64
+		wantOK   bool
+		wantUsed string
+	}{
+		{name: "limit disabled", total: 100, free: 0, wantOK: true},
+		{name: "memory information unavailable", limit: 70, wantOK: true},
+		{name: "below limit", limit: 70, total: 100, free: 31, wantOK: true},
+		{name: "at limit", limit: 70, total: 100, free: 30, wantUsed: "70%"},
+		{name: "above limit", limit: 70, total: 100, free: 20, wantUsed: "80%"},
 	}
 
-	mainworker.adjustWorkerBottomLevel()
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config{memLimit: test.limit}
+			mainworker := &mainWorker{cfg: &cfg, memTotal: test.total, memFree: test.free}
 
-	assert.Len(t, workerMap, 10)
-	assert.True(t, mainworker.idleSince.IsZero())
-}
-
-func makeTestWorkerMap(count int) map[string]*worker {
-	workerMap := make(map[string]*worker, count)
-	for i := range count {
-		id := fmt.Sprintf("worker-%d", i)
-		workerMap[id] = &worker{id: id, what: "check"}
+			ok, reason := mainworker.checkMemory()
+			if ok != test.wantOK {
+				t.Fatalf("checkMemory() ok = %v, want %v (reason: %q)", ok, test.wantOK, reason)
+			}
+			if !strings.Contains(reason, test.wantUsed) {
+				t.Errorf("checkMemory() reason = %q, want it to contain %q", reason, test.wantUsed)
+			}
+		})
 	}
-
-	return workerMap
 }

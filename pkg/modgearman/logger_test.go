@@ -81,3 +81,17 @@ func TestCreateLogger(t *testing.T) {
 		t.Errorf("could not remove loggertest")
 	}
 }
+
+func TestSetLogLevel(t *testing.T) {
+	t.Cleanup(func() { setLogLevel(LogLevelInfo) })
+
+	setLogLevel(LogLevelInfo)
+	if log.IsV(1) {
+		t.Error("info log level unexpectedly enables verbose logging")
+	}
+
+	setLogLevel(LogLevelTrace)
+	if !log.IsV(2) {
+		t.Error("trace log level does not enable verbose logging")
+	}
+}
